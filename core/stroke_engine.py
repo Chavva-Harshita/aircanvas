@@ -2,10 +2,10 @@
 core/stroke_engine.py  (v5 — single light blue, slim strokes)
 """
 
-import cv2
+import cv2 # type: ignore
 import math
 import random
-import numpy as np
+import numpy as np # type: ignore
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -32,25 +32,27 @@ class Stroke:
     age: float = 0.0
 
 # ── Tuning — change these to adjust the look ──────────────────────────────────
-BASE_WIDTH      = 3       # ← stroke thickness (try 2–8)
-INK_DECAY       = 0.97
-MAX_GAP         = 10
+BASE_WIDTH      = 1      # ← stroke thickness (try 2–8)
+INK_DECAY       = 0.985
+MAX_GAP         = 5
 INTERP_STEPS    = 8
-MAX_PARTICLES   = 400
-PARTICLE_LIFE   = 0.55
+MAX_PARTICLES   = 50
+PARTICLE_LIFE   = 0.25
 GLITTER_DENSITY = 0.45
 
 # Single light-blue palette — all layers are shades of this one colour
-CORE_COLOR  = (255, 230, 160)   # BGR: bright icy blue-white core
-BLOOM_COLOR = (220, 160,  60)   # BGR: medium blue bloom
-HALO_COLOR  = (120,  60,  10)   # BGR: deep blue outer halo
-GLITTER_COLORS = [
-    (255, 240, 180),   # near-white ice blue
-    (255, 220, 120),   # light blue
-    (200, 180,  80),   # softer blue
-    (255, 255, 220),   # white-blue
-]
+# Molten silver + fire palette
 
+CORE_COLOR  = (230, 230, 240)   # silver-white metal
+BLOOM_COLOR = (180, 180, 200)   # steel glow
+HALO_COLOR  = (40, 60, 90)      # dark steel edge
+
+GLITTER_COLORS = [
+    (255, 255, 255),   # white spark
+    (220, 220, 230),   # silver spark
+    (0, 140, 255),     # orange fire
+    (0, 90, 255),      # deep ember
+]
 
 def _catmull_rom(p0, p1, p2, p3, t):
     t2, t3 = t*t, t*t*t
@@ -159,12 +161,13 @@ class StrokeEngine:
             pt1   = (int(p1.x), int(p1.y))
 
             # 3-layer light-blue glow
-            cv2.line(self._canvas, pt0, pt1, HALO_COLOR,  width+14, cv2.LINE_AA)
-            cv2.line(self._canvas, pt0, pt1, BLOOM_COLOR, width+5,  cv2.LINE_AA)
-            cv2.line(self._canvas, pt0, pt1, CORE_COLOR,  width,    cv2.LINE_AA)
+           # Ultra slim metallic stroke
+            cv2.line(self._canvas, pt0, pt1, HALO_COLOR,  width+4, cv2.LINE_AA)
+            cv2.line(self._canvas, pt0, pt1, BLOOM_COLOR, width+2, cv2.LINE_AA)
+            cv2.line(self._canvas, pt0, pt1, CORE_COLOR,  width,   cv2.LINE_AA)
 
             # Round caps so segments join cleanly
-            r = max(1, width // 2)
+            r = 1
             cv2.circle(self._canvas, pt0, r, CORE_COLOR, -1, cv2.LINE_AA)
             cv2.circle(self._canvas, pt1, r, CORE_COLOR, -1, cv2.LINE_AA)
 
@@ -180,31 +183,36 @@ class StrokeEngine:
         cv2.circle(self._canvas, (x,y), BASE_WIDTH,    CORE_COLOR,  -1, cv2.LINE_AA)
 
     def _paint_glitter_dot(self, x, y):
-        if not (2 <= x < self.W-2 and 2 <= y < self.H-2):
-            return
-        col  = random.choice(GLITTER_COLORS)
-        size = random.randint(1, 4)
-        # 4-pointed star
-        cv2.line(self._glitter, (x-size,y), (x+size,y), col, 1, cv2.LINE_AA)
-        cv2.line(self._glitter, (x,y-size), (x,y+size), col, 1, cv2.LINE_AA)
-        cv2.circle(self._glitter, (x,y), 1, (255,255,255), -1, cv2.LINE_AA)
+    if not (2 <= x < self.W-2 and 2 <= y < self.H-2): # type: ignore
+        return
 
-    def _spawn_glitter(self, x, y, speed):
-        if len(self._particles) >= MAX_PARTICLES:
-            return
-        count = 3 + min(6, int(speed / 900))
-        for _ in range(count):
-            angle = random.uniform(0, math.tau)
-            mag   = random.uniform(0.2, 2.8)
-            self._particles.append(Particle(
-                x=float(x) + random.uniform(-5, 5),
-                y=float(y) + random.uniform(-5, 5),
-                vx=math.cos(angle)*mag, vy=math.sin(angle)*mag,
-                life=PARTICLE_LIFE * random.uniform(0.4, 1.0),
-                max_life=PARTICLE_LIFE,
-                size=random.randint(1, 3),
-            ))
+    col = random.choice(GLITTER_COLORS)
 
+    # tiny hot spark
+    cv2.circle(
+        self._glitter, # type: ignore
+        (x, y), # type: ignore
+        random.randint(1, 2),
+        col,
+        -1,
+        cv2.LINE_AA
+    )
+
+    # occasional streak spark
+    if random.random() < 0.35:
+        angle = random.uniform(0, math.tau)
+
+        dx = int(math.cos(angle) * random.randint(3, 8))
+        dy = int(math.sin(angle) * random.randint(3, 8))
+
+        cv2.line(
+            self._glitter, # type: ignore
+            (x, y), # type: ignore
+            (x + dx, y + dy), # type: ignore
+            col,
+            1,
+            cv2.LINE_AA
+        )
     def _update_particles(self, dt):
         alive = []
         for p in self._particles:
