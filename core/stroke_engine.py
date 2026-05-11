@@ -15,7 +15,6 @@ class StrokePoint:
     x: float
     y: float
     speed: float = 0.0
-
 @dataclass
 class Particle:
     x: float
@@ -182,37 +181,61 @@ class StrokeEngine:
         cv2.circle(self._canvas, (x,y), BASE_WIDTH+4,  BLOOM_COLOR, -1, cv2.LINE_AA)
         cv2.circle(self._canvas, (x,y), BASE_WIDTH,    CORE_COLOR,  -1, cv2.LINE_AA)
 
-    def _paint_glitter_dot(self, x, y):
-    if not (2 <= x < self.W-2 and 2 <= y < self.H-2): # type: ignore
-        return
+    def _spawn_glitter(self, x, y, speed):
+        if random.random() < 0.4:
+            self._paint_glitter_dot(x, y)
 
-    col = random.choice(GLITTER_COLORS)
+        if speed <= 0.0:
+            return
 
-    # tiny hot spark
-    cv2.circle(
-        self._glitter, # type: ignore
-        (x, y), # type: ignore
-        random.randint(1, 2),
-        col,
-        -1,
-        cv2.LINE_AA
-    )
+        if len(self._particles) >= MAX_PARTICLES:
+            return
 
-    # occasional streak spark
-    if random.random() < 0.35:
         angle = random.uniform(0, math.tau)
+        speed_factor = min(max(speed / 40.0, 0.5), 3.0)
 
-        dx = int(math.cos(angle) * random.randint(3, 8))
-        dy = int(math.sin(angle) * random.randint(3, 8))
+        self._particles.append(Particle(
+            float(x),
+            float(y),
+            math.cos(angle) * speed_factor,
+            math.sin(angle) * speed_factor,
+            random.uniform(PARTICLE_LIFE * 0.5, PARTICLE_LIFE * 1.2),
+            PARTICLE_LIFE,
+            random.randint(1, 3),
+        ))
 
-        cv2.line(
+    def _paint_glitter_dot(self, x, y):
+        if not (2 <= x < self.W-2 and 2 <= y < self.H-2): # type: ignore
+            return
+
+        col = random.choice(GLITTER_COLORS)
+
+        # tiny hot spark
+        cv2.circle(
             self._glitter, # type: ignore
             (x, y), # type: ignore
-            (x + dx, y + dy), # type: ignore
+            random.randint(1, 2),
             col,
-            1,
-            cv2.LINE_AA
+            -1,
+            cv2.LINE_AA,
         )
+
+        # occasional streak spark
+        if random.random() < 0.35:
+            angle = random.uniform(0, math.tau)
+
+            dx = int(math.cos(angle) * random.randint(3, 8))
+            dy = int(math.sin(angle) * random.randint(3, 8))
+
+            cv2.line(
+                self._glitter, # type: ignore
+                (x, y), # type: ignore
+                (x + dx, y + dy), # type: ignore
+                col,
+                1,
+                cv2.LINE_AA
+            )
+
     def _update_particles(self, dt):
         alive = []
         for p in self._particles:
