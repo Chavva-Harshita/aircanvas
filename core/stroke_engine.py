@@ -1,12 +1,5 @@
 """
-core/stroke_engine.py  (v2 — smooth continuous strokes)
-─────────────────────
-Key improvements over v1:
-  • Catmull-Rom spline interpolation between points → no broken segments
-  • Gap filling: if finger jumps >MAX_GAP pixels, intermediate points are
-    synthesised so the line never breaks mid-letter
-  • Thicker base width and gentler speed-taper so fast strokes stay visible
-  • Smoother glow layers with rounded line caps
+core/stroke_engine.py  (v5 — single light blue, slim strokes)
 """
 
 import cv2
@@ -17,14 +10,11 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 
-# ── Data structures ───────────────────────────────────────────────────────────
-
 @dataclass
 class StrokePoint:
     x: float
     y: float
     speed: float = 0.0
-
 
 @dataclass
 class Particle:
@@ -34,98 +24,72 @@ class Particle:
     vy: float
     life: float
     max_life: float
-
+    size: int = 1
 
 @dataclass
 class Stroke:
     points: List[StrokePoint] = field(default_factory=list)
     age: float = 0.0
 
+# ── Tuning — change these to adjust the look ──────────────────────────────────
+BASE_WIDTH      = 3       # ← stroke thickness (try 2–8)
+INK_DECAY       = 0.97
+MAX_GAP         = 10
+INTERP_STEPS    = 8
+MAX_PARTICLES   = 400
+PARTICLE_LIFE   = 0.55
+GLITTER_DENSITY = 0.45
 
-# ── Tuning constants ──────────────────────────────────────────────────────────
+# Single light-blue palette — all layers are shades of this one colour
+CORE_COLOR  = (255, 230, 160)   # BGR: bright icy blue-white core
+BLOOM_COLOR = (220, 160,  60)   # BGR: medium blue bloom
+HALO_COLOR  = (120,  60,  10)   # BGR: deep blue outer halo
+GLITTER_COLORS = [
+    (255, 240, 180),   # near-white ice blue
+    (255, 220, 120),   # light blue
+    (200, 180,  80),   # softer blue
+    (255, 255, 220),   # white-blue
+]
 
-BASE_WIDTH        = 9      # core stroke thickness in pixels
-SPEED_FACTOR      = 0.005  # very gentle taper — keeps fast strokes thick
-INK_DECAY         = 0.993  # canvas fade per frame
-MAX_GAP           = 15     # pixels — fill gaps larger than this
-INTERP_STEPS      = 6      # extra points inserted per segment
-PARTICLE_SPEED    = 22     # px/frame threshold to spawn sparks
-MAX_PARTICLES     = 180
-PARTICLE_LIFE     = 0.4
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _catmull_rom(p0, p1, p2, p3, t):
-    """Single Catmull-Rom spline evaluation at parameter t ∈ [0,1]."""
-    t2 = t * t
-    t3 = t2 * t
-    x = 0.5 * ((2*p1[0]) +
-                (-p0[0] + p2[0]) * t +
-                (2*p0[0] - 5*p1[0] + 4*p2[0] - p3[0]) * t2 +
-                (-p0[0] + 3*p1[0] - 3*p2[0] + p3[0]) * t3)
-    y = 0.5 * ((2*p1[1]) +
-                (-p0[1] + p2[1]) * t +
-                (2*p0[1] - 5*p1[1] + 4*p2[1] - p3[1]) * t2 +
-                (-p0[1] + 3*p1[1] - 3*p2[1] + p3[1]) * t3)
+    t2, t3 = t*t, t*t*t
+    x = 0.5*((2*p1[0])+(-p0[0]+p2[0])*t+(2*p0[0]-5*p1[0]+4*p2[0]-p3[0])*t2+(-p0[0]+3*p1[0]-3*p2[0]+p3[0])*t3)
+    y = 0.5*((2*p1[1])+(-p0[1]+p2[1])*t+(2*p0[1]-5*p1[1]+4*p2[1]-p3[1])*t2+(-p0[1]+3*p1[1]-3*p2[1]+p3[1])*t3)
     return x, y
 
 
-def _interpolate_stroke(points: List[StrokePoint], steps: int = INTERP_STEPS):
-    """
-    Expand a list of StrokePoints into a much denser list using
-    Catmull-Rom splines.  This guarantees smooth curves even when
-    MediaPipe delivers positions at ~15-20 Hz.
-    """
+def _interpolate_stroke(points, steps=INTERP_STEPS):
     if len(points) < 2:
         return points
-
     dense = []
     n = len(points)
-
     for i in range(n - 1):
-        # Clamp indices for boundary control points
-        i0 = max(i - 1, 0)
-        i1 = i
-        i2 = i + 1
-        i3 = min(i + 2, n - 1)
-
+        i0, i1 = max(i-1, 0), i
+        i2, i3 = i+1, min(i+2, n-1)
         p0 = (points[i0].x, points[i0].y)
         p1 = (points[i1].x, points[i1].y)
         p2 = (points[i2].x, points[i2].y)
         p3 = (points[i3].x, points[i3].y)
-
         avg_speed = (points[i1].speed + points[i2].speed) / 2.0
-
         for s in range(steps):
-            t = s / steps
-            x, y = _catmull_rom(p0, p1, p2, p3, t)
+            x, y = _catmull_rom(p0, p1, p2, p3, s/steps)
             dense.append(StrokePoint(x, y, avg_speed))
-
     dense.append(points[-1])
     return dense
 
 
 class StrokeEngine:
-    """
-    Manages strokes and particles; renders them onto a floating ink canvas.
-    """
-
     def __init__(self, width: int, height: int):
         self.W = width
         self.H = height
-
-        # Persistent float32 canvas — fades slowly each frame
         self._canvas   = np.zeros((height, width, 3), dtype=np.float32)
-
-        self._strokes:   List[Stroke]    = []
-        self._particles: List[Particle]  = []
+        self._glitter  = np.zeros((height, width, 3), dtype=np.float32)
+        self._strokes:   List[Stroke]   = []
+        self._particles: List[Particle] = []
         self._current:   Optional[Stroke] = None
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
     def add_point(self, x: int, y: int, dt: float):
-        """Called every frame while the finger is in DRAW mode."""
         if self._current is None:
             self._current = Stroke()
             self._strokes.append(self._current)
@@ -135,10 +99,6 @@ class StrokeEngine:
             prev  = self._current.points[-1]
             dist  = math.hypot(x - prev.x, y - prev.y)
             speed = dist / max(dt, 1e-4)
-
-            # ── Gap filling ───────────────────────────────────────────────────
-            # If the finger jumped a lot in one frame, insert intermediate
-            # points so the line doesn't break.
             if dist > MAX_GAP:
                 steps = max(2, int(dist / MAX_GAP))
                 for k in range(1, steps):
@@ -148,135 +108,122 @@ class StrokeEngine:
                     self._current.points.append(StrokePoint(ix, iy, speed))
 
         self._current.points.append(StrokePoint(float(x), float(y), speed))
-
-        # Particle sparks on fast movement
-        if speed > PARTICLE_SPEED * 60 and len(self._particles) < MAX_PARTICLES:
-            self._spawn_particles(x, y, speed)
+        self._spawn_glitter(x, y, speed)
 
     def lift_pen(self):
         self._current = None
 
     def clear(self):
         self._canvas[:]  = 0
+        self._glitter[:] = 0
         self._strokes.clear()
         self._particles.clear()
         self._current = None
 
     def render(self, dt: float, glow_mode: bool) -> np.ndarray:
-        """Render all strokes + particles; return uint8 BGR image."""
+        self._canvas  *= INK_DECAY
+        self._glitter *= 0.80
 
-        # 1. Fade existing ink
-        self._canvas *= INK_DECAY
-
-        # 2. Draw strokes
         for stroke in self._strokes:
-            self._draw_stroke(stroke, glow_mode)
+            self._draw_stroke(stroke)
 
-        # 3. Particles
         self._update_particles(dt)
-        self._draw_particles(glow_mode)
+        self._draw_particles()
 
-        # 4. Age & prune old strokes
-        for stroke in self._strokes:
-            if stroke is not self._current:
-                stroke.age += dt
+        merged = 255.0 - (255.0 - self._canvas) * (255.0 - self._glitter) / 255.0
+
+        for s in self._strokes:
+            if s is not self._current:
+                s.age += dt
         self._strokes = [s for s in self._strokes
-                         if s is self._current or s.age < 60.0]
+                         if s is self._current or s.age < 45.0]
 
-        return np.clip(self._canvas, 0, 255).astype(np.uint8)
+        return np.clip(merged, 0, 255).astype(np.uint8)
 
-    # ── Private rendering ─────────────────────────────────────────────────────
-
-    def _draw_stroke(self, stroke: Stroke, glow_mode: bool):
+    def _draw_stroke(self, stroke: Stroke):
         pts = stroke.points
         if len(pts) < 2:
             if pts:
-                self._dot(int(pts[0].x), int(pts[0].y), glow_mode)
+                self._dot(int(pts[0].x), int(pts[0].y))
             return
 
-        # Interpolate to smooth curve
         dense = _interpolate_stroke(pts)
 
         for i in range(1, len(dense)):
-            p0, p1 = dense[i - 1], dense[i]
-
-            dx = p1.x - p0.x
-            dy = p1.y - p0.y
-            if abs(dx) < 0.5 and abs(dy) < 0.5:
+            p0, p1 = dense[i-1], dense[i]
+            if abs(p1.x-p0.x) < 0.3 and abs(p1.y-p0.y) < 0.3:
                 continue
 
-            avg_speed = (p0.speed + p1.speed) / 2.0
-            width = max(2, int(BASE_WIDTH / (1 + avg_speed * SPEED_FACTOR)))
+            width = max(1, BASE_WIDTH)   # fixed slim width
+            pt0   = (int(p0.x), int(p0.y))
+            pt1   = (int(p1.x), int(p1.y))
 
-            # Brightness: slight dim on very fast strokes
-            alpha = max(0.55, 1.0 - avg_speed * 0.00005)
+            # 3-layer light-blue glow
+            cv2.line(self._canvas, pt0, pt1, HALO_COLOR,  width+14, cv2.LINE_AA)
+            cv2.line(self._canvas, pt0, pt1, BLOOM_COLOR, width+5,  cv2.LINE_AA)
+            cv2.line(self._canvas, pt0, pt1, CORE_COLOR,  width,    cv2.LINE_AA)
 
-            pt0 = (int(p0.x), int(p0.y))
-            pt1 = (int(p1.x), int(p1.y))
+            # Round caps so segments join cleanly
+            r = max(1, width // 2)
+            cv2.circle(self._canvas, pt0, r, CORE_COLOR, -1, cv2.LINE_AA)
+            cv2.circle(self._canvas, pt1, r, CORE_COLOR, -1, cv2.LINE_AA)
 
-            if glow_mode:
-                # Warm core, electric blue halo
-                halo_col  = (int(15  * alpha), int(8   * alpha), int(4   * alpha))
-                bloom_col = (int(160 * alpha), int(90  * alpha), int(15  * alpha))
-                core_col  = (int(255 * alpha), int(235 * alpha), int(190 * alpha))
-            else:
-                d = int(255 * alpha)
-                halo_col  = (int(d * 0.04),) * 3
-                bloom_col = (int(d * 0.28),) * 3
-                core_col  = (d, d, d)
+            # Inline glitter sparkles
+            if random.random() < GLITTER_DENSITY:
+                gx = int((p0.x + p1.x) / 2) + random.randint(-6, 6)
+                gy = int((p0.y + p1.y) / 2) + random.randint(-6, 6)
+                self._paint_glitter_dot(gx, gy)
 
-            # Layer 1: wide soft halo
-            cv2.line(self._canvas, pt0, pt1, halo_col,  width + 16, cv2.LINE_AA)
-            # Layer 2: bloom ring
-            cv2.line(self._canvas, pt0, pt1, bloom_col, width + 6,  cv2.LINE_AA)
-            # Layer 3: crisp bright core
-            cv2.line(self._canvas, pt0, pt1, core_col,  width,      cv2.LINE_AA)
+    def _dot(self, x, y):
+        cv2.circle(self._canvas, (x,y), BASE_WIDTH+10, HALO_COLOR,  -1, cv2.LINE_AA)
+        cv2.circle(self._canvas, (x,y), BASE_WIDTH+4,  BLOOM_COLOR, -1, cv2.LINE_AA)
+        cv2.circle(self._canvas, (x,y), BASE_WIDTH,    CORE_COLOR,  -1, cv2.LINE_AA)
 
-            # Round caps — circles at each endpoint close segment gaps
-            cv2.circle(self._canvas, pt0, width // 2, core_col, -1, cv2.LINE_AA)
-            cv2.circle(self._canvas, pt1, width // 2, core_col, -1, cv2.LINE_AA)
+    def _paint_glitter_dot(self, x, y):
+        if not (2 <= x < self.W-2 and 2 <= y < self.H-2):
+            return
+        col  = random.choice(GLITTER_COLORS)
+        size = random.randint(1, 4)
+        # 4-pointed star
+        cv2.line(self._glitter, (x-size,y), (x+size,y), col, 1, cv2.LINE_AA)
+        cv2.line(self._glitter, (x,y-size), (x,y+size), col, 1, cv2.LINE_AA)
+        cv2.circle(self._glitter, (x,y), 1, (255,255,255), -1, cv2.LINE_AA)
 
-    def _dot(self, x: int, y: int, glow_mode: bool):
-        if glow_mode:
-            cv2.circle(self._canvas, (x, y), 12, (15, 8, 4),    -1, cv2.LINE_AA)
-            cv2.circle(self._canvas, (x, y),  5, (200, 120, 30),-1, cv2.LINE_AA)
-            cv2.circle(self._canvas, (x, y),  2, (255, 235, 190),-1, cv2.LINE_AA)
-        else:
-            cv2.circle(self._canvas, (x, y), 10, (8, 8, 8),     -1, cv2.LINE_AA)
-            cv2.circle(self._canvas, (x, y),  4, (200, 200, 200),-1, cv2.LINE_AA)
-            cv2.circle(self._canvas, (x, y),  2, (255, 255, 255),-1, cv2.LINE_AA)
-
-    def _spawn_particles(self, x: int, y: int, speed: float):
-        count = min(5, int(speed / 600))
+    def _spawn_glitter(self, x, y, speed):
+        if len(self._particles) >= MAX_PARTICLES:
+            return
+        count = 3 + min(6, int(speed / 900))
         for _ in range(count):
             angle = random.uniform(0, math.tau)
-            mag   = random.uniform(0.5, 2.5)
+            mag   = random.uniform(0.2, 2.8)
             self._particles.append(Particle(
-                x=float(x), y=float(y),
-                vx=math.cos(angle) * mag,
-                vy=math.sin(angle) * mag,
-                life=PARTICLE_LIFE * random.uniform(0.6, 1.0),
+                x=float(x) + random.uniform(-5, 5),
+                y=float(y) + random.uniform(-5, 5),
+                vx=math.cos(angle)*mag, vy=math.sin(angle)*mag,
+                life=PARTICLE_LIFE * random.uniform(0.4, 1.0),
                 max_life=PARTICLE_LIFE,
+                size=random.randint(1, 3),
             ))
 
-    def _update_particles(self, dt: float):
+    def _update_particles(self, dt):
         alive = []
         for p in self._particles:
-            p.x  += p.vx * 60 * dt
-            p.y  += p.vy * 60 * dt
-            p.vx *= 0.92
-            p.vy *= 0.92
+            p.x += p.vx * 60 * dt
+            p.y += p.vy * 60 * dt
+            p.vx *= 0.91
+            p.vy *= 0.91
             p.life -= dt
             if p.life > 0:
                 alive.append(p)
         self._particles = alive
 
-    def _draw_particles(self, glow_mode: bool):
+    def _draw_particles(self):
         for p in self._particles:
             frac = p.life / p.max_life
-            brightness = int(255 * frac)
+            col  = tuple(int(c * frac) for c in random.choice(GLITTER_COLORS))
             x, y = int(p.x), int(p.y)
-            if 0 <= x < self.W and 0 <= y < self.H:
-                color = (brightness // 2, brightness // 3, brightness // 8) \
-                        if glow_mode else (brightness,) * 3
-                cv2.circle(self._canvas, (x, y), 2, color, -1, cv2.LINE_AA)
+            if not (0 <= x < self.W and 0 <= y < self.H):
+                continue
+            s = p.size
+            cv2.line(self._glitter, (x-s,y), (x+s,y), col, 1, cv2.LINE_AA)
+            cv2.line(self._glitter, (x,y-s), (x,y+s), col, 1, cv2.LINE_AA)
